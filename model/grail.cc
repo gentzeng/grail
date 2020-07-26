@@ -324,6 +324,9 @@ struct GrailApplication::Priv
     case SYS_nanosleep:
       res = HandleNanoSleep();
       break;
+    case SYS_clock_nanosleep:
+      res = HandleClockNanoSleep();
+      break;
     case SYS_time:
       res = HandleTime();
       break;
@@ -2011,6 +2014,44 @@ struct GrailApplication::Priv
     Simulator::Schedule(Seconds(_req->tv_sec)+NanoSeconds(_req->tv_nsec), MakeFunctionalEvent(cb));
 
     free(_req);
+    return SYSC_DELAYED;
+  }
+
+  // int clock_nanosleep(clockid_t clockid, int flags,
+  //                     const struct timespec *request,
+  //                     struct timespec *remain);
+  SyscallHandlerStatusCode HandleClockNanoSleep() {
+    clockid_t clockid;
+    int flags;
+    struct timespec *request;
+    // struct timespec *remain;
+
+    read_args(pid, clockid, flags, request/*, remain*/);
+
+    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC) {
+      NS_LOG_ERROR(PNAME << ": [EE] unsupported clock type: " << clockid);
+      return SYSC_ERROR;
+    }
+
+    if (flags != 0) {
+      NS_LOG_ERROR(PNAME << ": [EE] unsupported clock flags: " << flags);
+      return SYSC_ERROR;
+    }
+
+    struct timespec* myrequest = (timespec*)malloc(ALIGN(sizeof(struct timespec)));
+    MemcpyFromTracee(pid, myrequest, request, sizeof(struct timespec));
+
+    std::function<void()> cb = [this](){
+      SyscallHandlerStatusCode res = SYSC_SUCCESS;
+      do {
+        FAKE2(0);
+      } while(0);
+      ProcessStatusCode(res, SYS_clock_nanosleep);
+    };
+
+    Simulator::Schedule(Seconds(myrequest->tv_sec)+NanoSeconds(myrequest->tv_nsec), MakeFunctionalEvent(cb));
+
+    free(myrequest);
     return SYSC_DELAYED;
   }
   
