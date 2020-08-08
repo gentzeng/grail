@@ -141,6 +141,14 @@ struct GrailApplication::Priv
   // We coin these sockets "fake accepted" and store them here.
   std::map<int,std::tuple<Ptr<Socket>,Address>> m_fakeAcceptedSockets; 
 
+  // event handling
+  EventId nextEvent;
+  int delayedEventSyscallNumber;
+
+  // alarm(2)
+  EventId alarmEvent;
+  Time    alarmTime;
+
   // Returns a new, unused file descriptor.
   int GetNextFD() {
     NS_ASSERT(availableFDs.begin() != availableFDs.end() && "Out of file descriptors!");
@@ -153,24 +161,25 @@ struct GrailApplication::Priv
   PollLoopDetector<SimpleGettimeofdaySelectLoopDetector, ExponentialBackoffStrategy> pollLoopDetector;
   
   int DoTrace();
-  
+
   void ProcessStatusCode(SyscallHandlerStatusCode res, int syscall) {
     if(res == SYSC_MANUAL) {
       // do nothing and do not report
       // useful when calling callback directly, see e.g. HandleRecvFrom
     } else if(res == SYSC_SUCCESS) {
       NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds() << "s] emulated function succeeded, rr; syscall: " << syscname(syscall));
-      Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
+      nextEvent = Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
       return;
     } else if(res == SYSC_FAILURE) {
       NS_LOG_LOGIC(PNAME << ": [EE] emulated function failed, rr; syscall: " << syscname(syscall));
-      Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
+      nextEvent = Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
       return;
     } else if(res == SYSC_ERROR) {
       NS_LOG_ERROR(PNAME << ": [EE] emulated function crashed, syscall: " << syscname(syscall));
       exit(1);
     } else if(res == SYSC_DELAYED) {
       NS_LOG_LOGIC(PNAME << ": [EE] emulated function is delayed");
+      delayedEventSyscallNumber = syscall;
       // do nothing, handler is expected to register required events
     } else if(res == SYSC_SYSTEM_EXIT) {
       if(app->m_mayQuit) {
@@ -186,6 +195,9 @@ struct GrailApplication::Priv
 
   // This is the main loop entry point, which inspects each issued system call and selectively runs the call's appropriate handler.
   void HandleSyscallBefore() {
+
+    delayedEventSyscallNumber = -1;
+
     if (WaitForSyscall(pid) != 0) {
       return;
     }
@@ -353,6 +365,9 @@ struct GrailApplication::Priv
       break;
     case SYS_getrusage:
       res = HandleGetRUsage();
+      break;
+    case SYS_alarm:
+      res = HandleAlarm();
       break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
@@ -2010,8 +2025,8 @@ struct GrailApplication::Priv
       } while(0);
       ProcessStatusCode(res, SYS_nanosleep);
     };
-    
-    Simulator::Schedule(Seconds(_req->tv_sec)+NanoSeconds(_req->tv_nsec), MakeFunctionalEvent(cb));
+
+    nextEvent = Simulator::Schedule(Seconds(_req->tv_sec)+NanoSeconds(_req->tv_nsec), MakeFunctionalEvent(cb));
 
     free(_req);
     return SYSC_DELAYED;
@@ -2049,7 +2064,7 @@ struct GrailApplication::Priv
       ProcessStatusCode(res, SYS_clock_nanosleep);
     };
 
-    Simulator::Schedule(Seconds(myrequest->tv_sec)+NanoSeconds(myrequest->tv_nsec), MakeFunctionalEvent(cb));
+    nextEvent = Simulator::Schedule(Seconds(myrequest->tv_sec)+NanoSeconds(myrequest->tv_nsec), MakeFunctionalEvent(cb));
 
     free(myrequest);
     return SYSC_DELAYED;
@@ -2212,6 +2227,39 @@ struct GrailApplication::Priv
     MemcpyToTracee(pid, buf,_buf,buflen);
     
     FAKE(buflen);
+    return SYSC_SUCCESS;
+  }
+
+  void AlarmEventHelper() {
+
+    if (delayedEventSyscallNumber > -1) {
+      NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
+                    << "s] delayed function canceled.");
+      FAKE3(-EINTR);
+    }
+
+    nextEvent.Cancel ();
+    nextEvent = Simulator::ScheduleNow(&Priv::HandleSyscallBefore, this);
+
+    NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
+                  << "s] send signal SIGALRM to process.");
+    kill (pid, SIGALRM);
+  }
+
+  // unsigned int alarm(unsigned int seconds);
+  SyscallHandlerStatusCode HandleAlarm() {
+    unsigned int seconds;
+
+    read_args (pid, seconds);
+
+    Time timeLeft = Seconds (0);
+    if (alarmTime > Simulator::Now ()) {
+      alarmEvent.Cancel ();
+      timeLeft = alarmTime - Simulator::Now ();
+    }
+    alarmEvent = Simulator::Schedule (Seconds (seconds), &ns3::GrailApplication::Priv::AlarmEventHelper, this);
+
+    FAKE((unsigned)(timeLeft.GetSeconds ()));
     return SYSC_SUCCESS;
   }
 

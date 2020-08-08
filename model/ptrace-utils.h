@@ -72,6 +72,18 @@ enum SyscallHandlerStatusCode {
     NS_LOG_LOGIC(pid << ": [EE] FAKE syscall returned: " << ret_val);   \
   } while(0)
 
+// Same as FAKE, but does exit the simulation if WaitForSyscall(pid)
+// fails, which eludes the need to call ProcessStatusCode(). This
+// macro is used by the signal event helpers.
+#define FAKE3(ret_val) do {                                             \
+    set_reg(pid, orig_rax, SYS_getpid);                                 \
+    if (WaitForSyscall(pid) != 0) {                                     \
+      exit(1);                                                          \
+    }                                                                   \
+    set_reg(pid, rax, ret_val);                                         \
+    NS_LOG_LOGIC(pid << ": [EE] FAKE syscall returned: " << ret_val);   \
+  } while(0)
+
 // Aligns the supplied size to the specified PowerOfTwo
 #define ALIGN_SIZE( sizeToAlign, PowerOfTwo )       \
   (((sizeToAlign) + (PowerOfTwo) - 1) & ~((PowerOfTwo) - 1))
@@ -261,7 +273,12 @@ void StoreToTracee(int pid, T* from, T* to) {
 inline int WaitForSyscall(int pid) {
   int status;
   while (1) {
-    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    if (WSTOPSIG (status) == SIGALRM) {
+      ptrace(PTRACE_SYSCALL, pid, 0, SIGALRM);
+    } else {
+      ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    }
+
     waitpid(pid, &status, 0);
     if (WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80))
       return 0;
