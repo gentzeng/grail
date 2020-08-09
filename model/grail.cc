@@ -149,6 +149,12 @@ struct GrailApplication::Priv
   EventId alarmEvent;
   Time    alarmTime;
 
+  // interval timer (timer_settime(2), timer_gettime(2), timer_create(2), timer_delete(2))
+  int timer_count = 0;
+  std::map<int,EventId> m_timerEvents;
+  std::map<int,Time> m_timerIntervals;
+  std::map<int,Time> m_timerValues;
+
   // Returns a new, unused file descriptor.
   int GetNextFD() {
     NS_ASSERT(availableFDs.begin() != availableFDs.end() && "Out of file descriptors!");
@@ -368,6 +374,9 @@ struct GrailApplication::Priv
       break;
     case SYS_alarm:
       res = HandleAlarm();
+      break;
+    case SYS_timer_create:
+      res = HandleTimerCreate();
       break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
@@ -2260,6 +2269,40 @@ struct GrailApplication::Priv
     alarmEvent = Simulator::Schedule (Seconds (seconds), &ns3::GrailApplication::Priv::AlarmEventHelper, this);
 
     FAKE((unsigned)(timeLeft.GetSeconds ()));
+    return SYSC_SUCCESS;
+  }
+
+  //int timer_create (clockid_t clockid, struct sigevent *sevp, timer_t *timerid);
+  SyscallHandlerStatusCode HandleTimerCreate() {
+    clockid_t clockid;
+    struct sigevent *sevp;
+    timer_t *timerid;
+    read_args(pid, clockid, sevp, timerid);
+
+    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
+    {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    struct sigevent mysevp;
+    LoadFromTracee(pid, &mysevp, sevp);
+    if (mysevp.sigev_notify != SIGEV_SIGNAL)
+    {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    timer_t mytimerid;
+    mytimerid = malloc(sizeof(long));
+
+    NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds()
+                 << "s] Create new timer with ID " << timer_count);
+
+    *(int*)mytimerid = timer_count++;
+    StoreToTracee(pid, &mytimerid, timerid);
+
+    FAKE(0);
     return SYSC_SUCCESS;
   }
 
