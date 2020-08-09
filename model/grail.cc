@@ -402,6 +402,9 @@ struct GrailApplication::Priv
     case SYS_epoll_wait:
       res = HandleEpollWait();
       break;
+    case SYS_pread64:
+      res = HandlePread64();
+      break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
       res = SYSC_SUCCESS;
@@ -2568,6 +2571,20 @@ struct GrailApplication::Priv
 
     FAKE(0);
     return SYSC_SUCCESS;
+  }
+
+  // ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+  SyscallHandlerStatusCode HandlePread64() {
+    int fd;
+    read_args(pid, fd);
+
+    if (! FdIsEmulatedSocket(fd))
+    {
+      return HandleSyscallAfter();
+    }
+
+    UNSUPPORTED("read from emulated fd");
+    return SYSC_ERROR;
   }
 
   Ptr<NetDevice> GetNetDeviceByName(const std::string& ifname) {
