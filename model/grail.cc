@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -157,6 +158,7 @@ struct GrailApplication::Priv
 
   // epoll fd handling (epoll_create(2), epoll_ctl(2), ...)
   std::set<int> m_epoll_fds;
+  std::map<int,epoll_data> m_epoll_data;
 
   // Returns a new, unused file descriptor.
   int GetNextFD() {
@@ -392,6 +394,9 @@ struct GrailApplication::Priv
       break;
     case SYS_epoll_create:
       res = HandleEpollCreate();
+      break;
+    case SYS_epoll_ctl:
+      res = HandleEpollCtl();
       break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
@@ -2479,6 +2484,44 @@ struct GrailApplication::Priv
     m_epoll_fds.insert(newEpollFd);
     FAKE(newEpollFd);
     return SYSC_SUCCESS;
+  }
+
+  // int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+  SyscallHandlerStatusCode HandleEpollCtl() {
+    int epfd;
+    int op;
+    int fd;
+    struct epoll_event *event;
+
+    read_args(pid, epfd, op, fd, event);
+
+    if (m_epoll_fds.find(epfd) == m_epoll_fds.end()) {
+      FAKE (-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    if (op == EPOLL_CTL_DEL) {
+      if (m_epoll_data.find(fd) == m_epoll_data.end()) {
+        FAKE(-ENOENT);
+        return SYSC_FAILURE;
+      }
+      m_epoll_data.erase(fd);
+      FAKE(0);
+      return SYSC_SUCCESS;
+    } else if(op == EPOLL_CTL_ADD) {
+      if (m_epoll_data.find(fd) != m_epoll_data.end()) {
+        FAKE(-EEXIST);
+        return SYSC_FAILURE;
+      }
+      struct epoll_event myevent;
+      LoadFromTracee(pid, &myevent, event);
+      m_epoll_data[fd] = myevent.data;
+      FAKE(0);
+      return SYSC_SUCCESS;
+    }
+
+    UNSUPPORTED("unsupported epoll operation: " << op);
+    return SYSC_ERROR;
   }
 
   Ptr<NetDevice> GetNetDeviceByName(const std::string& ifname) {
