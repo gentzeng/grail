@@ -155,6 +155,9 @@ struct GrailApplication::Priv
   std::map<int,Time> m_timerIntervals;
   std::map<int,Time> m_timerValues;
 
+  // epoll fd handling (epoll_create(2), epoll_ctl(2), ...)
+  std::set<int> m_epoll_fds;
+
   // Returns a new, unused file descriptor.
   int GetNextFD() {
     NS_ASSERT(availableFDs.begin() != availableFDs.end() && "Out of file descriptors!");
@@ -386,6 +389,9 @@ struct GrailApplication::Priv
       break;
     case SYS_timer_gettime:
       res = HandleTimerGettime();
+      break;
+    case SYS_epoll_create:
+      res = HandleEpollCreate();
       break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
@@ -2455,6 +2461,23 @@ struct GrailApplication::Priv
     StoreToTracee (pid, &mycurr_value, curr_value);
 
     FAKE(0);
+    return SYSC_SUCCESS;
+  }
+
+  // int epoll_create(int size);
+  SyscallHandlerStatusCode HandleEpollCreate() {
+    int size;
+
+    read_args(pid, size);
+
+    if (size < 1) {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    int newEpollFd = GetNextFD();
+    m_epoll_fds.insert(newEpollFd);
+    FAKE(newEpollFd);
     return SYSC_SUCCESS;
   }
 
