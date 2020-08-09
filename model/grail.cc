@@ -161,6 +161,11 @@ struct GrailApplication::Priv
   std::map<int,epoll_data> m_epoll_data;
   std::set<int> m_unpolled_events;
 
+  // Unix sockets
+  int unix_socket_buf_size = 4096;
+  std::map<int,std::tuple<void*,int> > m_unix_sockets;
+  std::map<int,int> m_unix_pairs;
+
   // Returns a new, unused file descriptor.
   int GetNextFD() {
     NS_ASSERT(availableFDs.begin() != availableFDs.end() && "Out of file descriptors!");
@@ -407,6 +412,9 @@ struct GrailApplication::Priv
       break;
     case SYS_pwrite64:
       res = HandlePwrite64();
+      break;
+    case SYS_socketpair:
+      res = HandleSocketPair();
       break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
@@ -2602,6 +2610,51 @@ struct GrailApplication::Priv
 
     UNSUPPORTED("write to emulated fd");
     return SYSC_ERROR;
+  }
+
+  // int socketpair(int domain, int type, int protocol, int sv[2])
+  SyscallHandlerStatusCode HandleSocketPair() {
+    int domain;
+    int type;
+    int protocol;
+    int sv[2];
+    int *svPtr = sv;
+
+    read_args(pid, domain, type, protocol, svPtr);
+
+    if (domain != AF_UNIX)
+    {
+      UNSUPPORTED("unsupported oscket domain " << domain);
+      return SYSC_ERROR;
+    }
+
+    if (type != SOCK_STREAM)
+    {
+      UNSUPPORTED("unsupported socket type " << type);
+      return SYSC_ERROR;
+    }
+
+    int mysv[2];
+    int *mysvPtr = mysv;
+
+    void *buf_1 = malloc(ALIGN(unix_socket_buf_size));
+    mysv[0] = GetNextFD();
+    m_sockets[mysv[0]] = NULL;
+    m_unix_sockets[mysv[0]] = std::make_tuple(buf_1, -1);
+    m_connectedSockets.insert(mysv[0]);
+
+    void *buf_2 = malloc(ALIGN(unix_socket_buf_size));
+    mysv[1] = GetNextFD();
+    m_sockets[mysv[1]] = NULL;
+    m_unix_sockets[mysv[0]] = std::make_tuple(buf_2, -1);
+    m_connectedSockets.insert(mysv[1]);
+
+    m_unix_pairs[mysv[0]] = mysv[1];
+    m_unix_pairs[mysv[1]] = mysv[0];
+    MemcpyToTracee(pid, svPtr, mysvPtr, sizeof(mysv));
+
+    FAKE(0);
+    return SYSC_SUCCESS;
   }
 
   Ptr<NetDevice> GetNetDeviceByName(const std::string& ifname) {
