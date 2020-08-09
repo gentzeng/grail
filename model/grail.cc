@@ -384,6 +384,9 @@ struct GrailApplication::Priv
     case SYS_timer_settime:
       res = HandleTimerSettime();
       break;
+    case SYS_timer_gettime:
+      res = HandleTimerGettime();
+      break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
       res = SYSC_SUCCESS;
@@ -2416,6 +2419,40 @@ struct GrailApplication::Priv
                                                      &ns3::GrailApplication::Priv::IntervalTimerEventHelper,
                                                      this, mytimerid);
     }
+
+    FAKE(0);
+    return SYSC_SUCCESS;
+  }
+
+  // int timer_gettime(timer_t timerid, struct itimerspec *curr_value);
+  SyscallHandlerStatusCode HandleTimerGettime() {
+    timer_t timerid;
+    struct itimerspec *curr_value;
+    struct itimerspec mycurr_value;
+
+    read_args(pid, timerid, curr_value);
+
+    int mytimerid = *(int*)timerid;
+    if (mytimerid >= timer_count)
+    {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    if (curr_value == NULL)
+    {
+      FAKE(-EFAULT);
+      return SYSC_FAILURE;
+    }
+
+    Time rem = Simulator::GetDelayLeft (m_timerEvents[mytimerid]);
+    Time ivl = m_timerIntervals[mytimerid];
+    mycurr_value.it_interval.tv_sec =  ivl.ToInteger (Time::S);
+    mycurr_value.it_interval.tv_nsec = ivl.ToInteger (Time::NS) - (ivl.ToInteger(Time::S) * 1000000000);
+    mycurr_value.it_value.tv_sec = rem.ToInteger (Time::S);
+    mycurr_value.it_value.tv_nsec = rem.ToInteger (Time::NS) - (rem.ToInteger(Time::S) * 1000000000);
+
+    StoreToTracee (pid, &mycurr_value, curr_value);
 
     FAKE(0);
     return SYSC_SUCCESS;
