@@ -159,6 +159,7 @@ struct GrailApplication::Priv
   // epoll fd handling (epoll_create(2), epoll_ctl(2), ...)
   std::set<int> m_epoll_fds;
   std::map<int,epoll_data> m_epoll_data;
+  std::set<int> m_unpolled_events;
 
   // Returns a new, unused file descriptor.
   int GetNextFD() {
@@ -397,6 +398,9 @@ struct GrailApplication::Priv
       break;
     case SYS_epoll_ctl:
       res = HandleEpollCtl();
+      break;
+    case SYS_epoll_wait:
+      res = HandleEpollWait();
       break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
@@ -2522,6 +2526,48 @@ struct GrailApplication::Priv
 
     UNSUPPORTED("unsupported epoll operation: " << op);
     return SYSC_ERROR;
+  }
+
+  // int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int
+  // timeout
+  SyscallHandlerStatusCode HandleEpollWait() {
+    int epfd;
+    struct epoll_event *events;
+    int maxevents;
+    int timeout;
+
+    read_args(pid, epfd, events, maxevents, timeout);
+
+    if (maxevents < 1) {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    if (timeout != 0) {
+      UNSUPPORTED ("epoll_wait(2) calls with timout");
+      return SYSC_ERROR;
+    }
+
+    if (m_epoll_fds.find(epfd) == m_epoll_fds.end()) {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    std::map<int, epoll_data>::iterator it = m_epoll_data.begin();
+    for (; it != m_epoll_data.end(); ++it) {
+      if (m_unpolled_events.find(it->first) != m_unpolled_events.end()) {
+        struct epoll_event myevent;
+        myevent.events = EPOLLIN;
+        myevent.data = it->second;
+        StoreToTracee(pid, &myevent, events);
+        m_unpolled_events.erase(it->first);
+        FAKE(1);
+        return SYSC_SUCCESS;
+      }
+    }
+
+    FAKE(0);
+    return SYSC_SUCCESS;
   }
 
   Ptr<NetDevice> GetNetDeviceByName(const std::string& ifname) {
