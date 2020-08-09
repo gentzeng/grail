@@ -378,6 +378,9 @@ struct GrailApplication::Priv
     case SYS_timer_create:
       res = HandleTimerCreate();
       break;
+    case SYS_timer_delete:
+      res = HandleTimerDelete();
+      break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
       res = SYSC_SUCCESS;
@@ -2301,6 +2304,26 @@ struct GrailApplication::Priv
 
     *(int*)mytimerid = timer_count++;
     StoreToTracee(pid, &mytimerid, timerid);
+
+    FAKE(0);
+    return SYSC_SUCCESS;
+  }
+
+  // int timer_delete(timer_t timerid);
+  SyscallHandlerStatusCode HandleTimerDelete() {
+    timer_t timerid;
+    read_args(pid, timerid);
+
+    int mytimerid = *(int*)timerid;
+    if (mytimerid >= timer_count)
+    {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    m_timerEvents[mytimerid].Cancel ();
+    m_timerIntervals[mytimerid] = Seconds (0);
+    m_timerValues[mytimerid] = Seconds (0);
 
     FAKE(0);
     return SYSC_SUCCESS;
