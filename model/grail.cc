@@ -405,6 +405,9 @@ struct GrailApplication::Priv
     case SYS_pread64:
       res = HandlePread64();
       break;
+    case SYS_pwrite64:
+      res = HandlePwrite64();
+      break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
       res = SYSC_SUCCESS;
@@ -2584,6 +2587,20 @@ struct GrailApplication::Priv
     }
 
     UNSUPPORTED("read from emulated fd");
+    return SYSC_ERROR;
+  }
+
+  // ssize_t pwrite(int fd, void *buf, size_t count, off_t offset);
+  SyscallHandlerStatusCode HandlePwrite64() {
+    int fd;
+
+    read_args(pid, fd);
+    if (! FdIsEmulatedSocket(fd))
+    {
+      return HandleSyscallAfter();
+    }
+
+    UNSUPPORTED("write to emulated fd");
     return SYSC_ERROR;
   }
 
