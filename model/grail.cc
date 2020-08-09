@@ -381,6 +381,9 @@ struct GrailApplication::Priv
     case SYS_timer_delete:
       res = HandleTimerDelete();
       break;
+    case SYS_timer_settime:
+      res = HandleTimerSettime();
+      break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
       res = SYSC_SUCCESS;
@@ -2324,6 +2327,95 @@ struct GrailApplication::Priv
     m_timerEvents[mytimerid].Cancel ();
     m_timerIntervals[mytimerid] = Seconds (0);
     m_timerValues[mytimerid] = Seconds (0);
+
+    FAKE(0);
+    return SYSC_SUCCESS;
+  }
+
+  void IntervalTimerEventHelper(int timerid) {
+    NS_LOG_FUNCTION (this << pid << timerid << Simulator::Now().GetSeconds());
+
+    if (delayedEventSyscallNumber > 0)
+    {
+      NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
+                   << "s] delayed function canceled.");
+      FAKE3(-EINTR);
+    }
+
+    nextEvent.Cancel ();
+    nextEvent = Simulator::ScheduleNow(&Priv::HandleSyscallBefore, this);
+
+    NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
+                  << "s] send signal SIGALRM to process.");
+    kill (pid, SIGALRM);
+
+    if ( ! m_timerIntervals[timerid].IsZero ())
+    {
+      m_timerEvents[timerid] = Simulator::Schedule(m_timerIntervals[timerid],
+                                                   &ns3::GrailApplication::Priv::IntervalTimerEventHelper,
+                                                   this, timerid);
+    }
+  }
+
+  //int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value, struct itimerspec *old_value);
+  SyscallHandlerStatusCode HandleTimerSettime() {
+    timer_t timerid;
+    int flags;
+    struct itimerspec *new_value;
+    struct itimerspec *old_value;
+    struct itimerspec mynew_value;
+    struct itimerspec myold_value;
+
+    read_args(pid, timerid, flags, new_value, old_value);
+
+    int mytimerid = *(int*)timerid;
+    if (mytimerid >= timer_count)
+    {
+      FAKE(-EINVAL);
+      return SYSC_FAILURE;
+    }
+
+    if (new_value == NULL)
+    {
+      FAKE(-EFAULT);
+      return SYSC_FAILURE;
+    }
+    LoadFromTracee(pid, &mynew_value, new_value);
+
+    if (old_value != NULL)
+    {
+      Time rem = Simulator::GetDelayLeft (m_timerEvents[mytimerid]);
+      Time ivl = m_timerIntervals[mytimerid];
+
+      myold_value.it_interval.tv_sec =  ivl.ToInteger (Time::S);
+      myold_value.it_interval.tv_nsec = ivl.ToInteger (Time::NS) - (ivl.ToInteger(Time::S) * 1000000000);
+      myold_value.it_value.tv_sec = rem.ToInteger (Time::S);
+      myold_value.it_value.tv_nsec = rem.ToInteger (Time::NS) - (rem.ToInteger(Time::S) * 1000000000);
+
+      StoreToTracee (pid, &myold_value, old_value);
+    }
+
+    time_t value_time_sec = mynew_value.it_value.tv_sec;
+    long value_time_nsec = mynew_value.it_value.tv_nsec;
+    Time value_time = Seconds(value_time_sec) + NanoSeconds(value_time_nsec);
+
+    time_t interval_time_sec = mynew_value.it_interval.tv_sec;
+    long interval_time_nsec = mynew_value.it_interval.tv_nsec;
+    Time interval_time = Seconds(interval_time_sec) + NanoSeconds(interval_time_nsec);
+
+    m_timerIntervals[mytimerid] = interval_time;
+    m_timerValues[mytimerid] = value_time;
+    m_timerEvents[mytimerid].Cancel();
+
+    if ( ! value_time.IsZero ())
+    {
+      NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds()
+                   << "s] arm timer " << mytimerid << " to trigger in: "
+                   << value_time);
+      m_timerEvents[mytimerid] = Simulator::Schedule(value_time,
+                                                     &ns3::GrailApplication::Priv::IntervalTimerEventHelper,
+                                                     this, mytimerid);
+    }
 
     FAKE(0);
     return SYSC_SUCCESS;

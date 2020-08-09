@@ -94,6 +94,7 @@ inline std::string syscname(int syscall) {
     CASESC(SYS_clock_nanosleep);
     CASESC(SYS_timer_create);
     CASESC(SYS_timer_delete);
+    CASESC(SYS_timer_settime);
   }
   std::stringstream ss;
   ss << syscall;
