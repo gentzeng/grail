@@ -26,7 +26,6 @@
 #include <assert.h>
 #include <stdint.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -48,6 +47,7 @@
 #include "ns3/ipv4-list-routing.h"
 #include "ns3/log.h"
 #include "ns3/network-module.h"
+#include "ns3/csma-module.h"
 #include "ns3/ipv4.h"
 #include "ns3/socket.h"
 #include "ns3/tcp-socket.h"
@@ -55,6 +55,9 @@
 #include "ns3/wifi-net-device.h"
 #include "ns3/point-to-point-net-device.h"
 #include "ns3/tcp-socket-base.h"
+
+// uml
+#include <sys/epoll.h>
 
 #ifndef __amd64__
 #error "As of now, the gRaIL implementation only supports the amd64 platform"
@@ -94,20 +97,30 @@ GrailApplication::GetTypeId (void)
                    MakeBooleanAccessor (&GrailApplication::m_mayQuit),
                    MakeBooleanChecker ())
     .AddAttribute ("EnablePreloading",
-                   "Use pre-loading technique to work around an enabled vDSO kernel flag.",
+                   "Use pre-loading technique to work around an enabled vDSO kernel flag",
                    BooleanValue (false),
                    MakeBooleanAccessor (&GrailApplication::m_enablePreloading),
                    MakeBooleanChecker ())
     .AddAttribute ("SyscallProcessingTime",
-                   "The simulated time accounted for by each system call.",
+                   "The simulated time accounted for by each system call",
                    TimeValue (NanoSeconds(0)),
                    MakeTimeAccessor (&GrailApplication::m_syscallProcessingTime),
                    MakeTimeChecker ())
     .AddAttribute ("PollLoopDetection",
-                   "Use a detection heuristic and backoff strategy for poll loops.",
+                   "Use a detection heuristic and backoff strategy for poll loops",
                    BooleanValue (true),
                    MakeBooleanAccessor (&GrailApplication::m_pollLoopDetection),
                    MakeBooleanChecker ())
+    .AddAttribute ("IsKairos",
+                   "Indicates whether the application is a kairos application (OS emulation)",
+                   BooleanValue (false),
+                   MakeBooleanAccessor (&GrailApplication::m_isKairos),
+                   MakeBooleanChecker ())
+    .AddAttribute ("KairosShutdownTime",
+                   "Time at which the Linux system will initiate a shutdown",
+                   TimeValue (TimeStep (0)),
+                   MakeTimeAccessor (&GrailApplication::m_kairosShutdownTime),
+                   MakeTimeChecker ())
   ;
   return tid;
 }
@@ -140,31 +153,27 @@ struct GrailApplication::Priv
   std::map<int,std::shared_ptr<NetlinkSocket> > m_netlinks; // A mapping from FD to a NetlinkSocket
   // Due to ns-3 limitations, sockets must be accepted before a call to accept was issued.
   // We coin these sockets "fake accepted" and store them here.
-  std::map<int,std::tuple<Ptr<Socket>,Address>> m_fakeAcceptedSockets; 
+  std::map<int,std::tuple<Ptr<Socket>,Address>> m_fakeAcceptedSockets;
 
-  // event handling
-  EventId nextEvent;
-  int delayedEventSyscallNumber;
-
-  // alarm(2)
-  EventId alarmEvent;
-  Time    alarmTime;
-
-  // interval timer (timer_settime(2), timer_gettime(2), timer_create(2), timer_delete(2))
+  // UML
+  // Interval timer handling
   int timer_count = 0;
   std::map<int,EventId> m_timerEvents;
   std::map<int,Time> m_timerIntervals;
   std::map<int,Time> m_timerValues;
-
-  // epoll fd handling (epoll_create(2), epoll_ctl(2), ...)
-  std::set<int> m_epoll_fds;
-  std::map<int,epoll_data> m_epoll_data;
-  std::set<int> m_unpolled_events;
-
-  // Unix sockets
+  // UML network daemon
   int unix_socket_buf_size = 4096;
+  int daemon_data_socket_count = 0;
   std::map<int,std::tuple<void*,int> > m_unix_sockets;
+  std::map<int,Ptr<ns3::NetDevice> > m_daemon_netdevice;
+  std::set<int> m_daemon_ctl_sockets;
+  std::set<int> m_daemon_data_sockets;
+  std::set<int> m_async_sockets;
   std::map<int,int> m_unix_pairs;
+  // UML epoll
+  std::set<int> m_epoll_fds;
+  std::map<int,epoll_event> m_epoll_events;
+  std::set<int> m_unpolled_events;
 
   // Returns a new, unused file descriptor.
   int GetNextFD() {
@@ -174,10 +183,15 @@ struct GrailApplication::Priv
     return fd;
   }
 
+  // UML used for return in case of signal interruption
+  EventId delayedEvent;
+  int     delayedSyscallNumber;
+
   // Used to detect poll loops with a very simple heuristric and add an exponential delay to system call processing time.
   PollLoopDetector<SimpleGettimeofdaySelectLoopDetector, ExponentialBackoffStrategy> pollLoopDetector;
-  
+
   int DoTrace();
+  void Shutdown();
 
   void ProcessStatusCode(SyscallHandlerStatusCode res, int syscall) {
     if(res == SYSC_MANUAL) {
@@ -185,18 +199,17 @@ struct GrailApplication::Priv
       // useful when calling callback directly, see e.g. HandleRecvFrom
     } else if(res == SYSC_SUCCESS) {
       NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds() << "s] emulated function succeeded, rr; syscall: " << syscname(syscall));
-      nextEvent = Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
+      Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
       return;
     } else if(res == SYSC_FAILURE) {
       NS_LOG_LOGIC(PNAME << ": [EE] emulated function failed, rr; syscall: " << syscname(syscall));
-      nextEvent = Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
+      Simulator::Schedule(app->m_syscallProcessingTime + pollLoopDetector.GetDelay(), &Priv::HandleSyscallBefore, this);
       return;
     } else if(res == SYSC_ERROR) {
       NS_LOG_ERROR(PNAME << ": [EE] emulated function crashed, syscall: " << syscname(syscall));
       exit(1);
     } else if(res == SYSC_DELAYED) {
       NS_LOG_LOGIC(PNAME << ": [EE] emulated function is delayed");
-      delayedEventSyscallNumber = syscall;
       // do nothing, handler is expected to register required events
     } else if(res == SYSC_SYSTEM_EXIT) {
       if(app->m_mayQuit) {
@@ -212,9 +225,6 @@ struct GrailApplication::Priv
 
   // This is the main loop entry point, which inspects each issued system call and selectively runs the call's appropriate handler.
   void HandleSyscallBefore() {
-
-    delayedEventSyscallNumber = -1;
-
     if (WaitForSyscall(pid) != 0) {
       return;
     }
@@ -222,15 +232,40 @@ struct GrailApplication::Priv
     NS_LOG_LOGIC(pid << ": [EE] [" << Simulator::Now().GetSeconds() << "s] caught syscall: " << syscname(syscall));
 
     if(app->m_pollLoopDetection) {
-      Time t = pollLoopDetector.HandleSystemCall(pid, syscall);
-      if ( t > Seconds(0) ) {
-        NS_LOG_LOGIC(pid << ": [EE] [" << Simulator::Now().GetSeconds() << "s] poll loop detected, current delay: " << t);
+      //if ((syscall != SYS_ptrace) && (syscall != SYS_clock_gettime)) {
+      if ((syscall != SYS_ptrace)) {
+        Time t = pollLoopDetector.HandleSystemCall(pid, syscall);
       }
+      //Time t = pollLoopDetector.HandleSystemCall(pid, syscall);
+      //if ( t > Seconds(0) ) {
+        //NS_LOG_LOGIC(pid << ": [EE] [" << Simulator::Now().GetSeconds() << "s] poll loop detected, current delay: " << t);
+      //}
     }
 
     SyscallHandlerStatusCode res;
     
     switch(syscall) {
+
+      // UML, Category I for now
+    case SYS_setsid:
+    case SYS_clone:
+    case SYS_wait4:
+    case SYS_statfs:
+    case SYS_sigaltstack:
+    case SYS_fsync:
+    case SYS_chown:
+    case SYS_kill:
+    case SYS_rt_sigreturn:
+    case SYS_mkdir:
+    case SYS_lstat:
+    case SYS_modify_ldt:
+    case SYS_rename:
+    case SYS_mknod:
+    case SYS_chmod:
+    //case SYS_ptrace:
+    case SYS_getdents64:
+    case SYS_rmdir:
+
       // Category I, i.e., no relevant IO:
     case SYS_execve:
     case SYS_brk:
@@ -353,9 +388,6 @@ struct GrailApplication::Priv
     case SYS_nanosleep:
       res = HandleNanoSleep();
       break;
-    case SYS_clock_nanosleep:
-      res = HandleClockNanoSleep();
-      break;
     case SYS_time:
       res = HandleTime();
       break;
@@ -383,39 +415,6 @@ struct GrailApplication::Priv
     case SYS_getrusage:
       res = HandleGetRUsage();
       break;
-    case SYS_alarm:
-      res = HandleAlarm();
-      break;
-    case SYS_timer_create:
-      res = HandleTimerCreate();
-      break;
-    case SYS_timer_delete:
-      res = HandleTimerDelete();
-      break;
-    case SYS_timer_settime:
-      res = HandleTimerSettime();
-      break;
-    case SYS_timer_gettime:
-      res = HandleTimerGettime();
-      break;
-    case SYS_epoll_create:
-      res = HandleEpollCreate();
-      break;
-    case SYS_epoll_ctl:
-      res = HandleEpollCtl();
-      break;
-    case SYS_epoll_wait:
-      res = HandleEpollWait();
-      break;
-    case SYS_pread64:
-      res = HandlePread64();
-      break;
-    case SYS_pwrite64:
-      res = HandlePwrite64();
-      break;
-    case SYS_socketpair:
-      res = HandleSocketPair();
-      break;
       // user permissions (for now fixed result (root), but could configurable via an ns-3 attribute in the future)
     case SYS_getuid:
       res = SYSC_SUCCESS;
@@ -432,6 +431,43 @@ struct GrailApplication::Priv
     case SYS_getegid:
       res = SYSC_SUCCESS;
       FAKE2(egid);
+      break;
+      // UML
+    case SYS_timer_create:
+      res = HandleTimerCreate();
+      break;
+    case SYS_timer_settime:
+      res = HandleTimerSettime();
+      break;
+    //case SYS_timer_gettime:
+      //res = HandleTimerGettime();
+      //break;
+    case SYS_timer_delete:
+      res = HandleTimerDelete();
+      break;
+    case SYS_epoll_create:
+      res = HandleEpollCreate();
+      break;
+    case SYS_epoll_ctl:
+      res = HandleEpollCtl();
+      break;
+    case SYS_epoll_wait:
+      res = HandleEpollWait();
+      break;
+    case SYS_socketpair:
+      res = HandleSocketPair();
+      break;
+    case SYS_pwrite64:
+      res = HandlePwrite64();
+      break;
+    case SYS_pread64:
+      res = HandlePread64();
+      break;
+    case SYS_clock_nanosleep:
+      res = HandleClockNanoSleep();
+      break;
+    case SYS_ptrace:
+      res = HandlePtrace();
       break;
 
     default:
@@ -584,6 +620,10 @@ struct GrailApplication::Priv
 
   //pid_t getpid(void);
   SyscallHandlerStatusCode HandleGetPid() {
+    if (app->m_isKairos) {
+      return HandleSyscallAfter ();
+    }
+
     FAKE(fake_pid);
     return SYSC_SUCCESS;
   }
@@ -658,9 +698,9 @@ struct GrailApplication::Priv
 
           FAKE2(rlen);
           res = SYSC_SUCCESS;
-        
+
         } while(false);
-      
+
         ProcessStatusCode(res, SYS_read);
 
         // reset ns3 callback (recvfrom is blocking, thus a one-shot callback)
@@ -685,6 +725,19 @@ struct GrailApplication::Priv
         return SYSC_DELAYED;
       }
     }
+    else if (m_unix_sockets.find(fd) != m_unix_sockets.end()) {
+      NS_LOG_LOGIC(pid << ": read from fd " << fd);
+      uint8_t* mybuf = (uint8_t*)std::get<0>(m_unix_sockets[fd]);
+      int length = std::get<1>(m_unix_sockets[fd]);
+      if (length < 0) {
+        FAKE(-EAGAIN);
+        return SYSC_FAILURE;
+      }
+      MemcpyToTracee(pid, buf, mybuf, length);
+      std::get<1>(m_unix_sockets[fd]) = -1; // "empty" buffer
+      FAKE(length);
+      return SYSC_SUCCESS;
+    }
     else {
       NS_LOG_ERROR(pid << "[EE] system call is not implemented to work on emulated file descriptors");
       exit(1);
@@ -699,6 +752,17 @@ struct GrailApplication::Priv
       // pass through
       return HandleSyscallAfter();
     } else if(m_sockets.find(fd) != m_sockets.end()) {
+
+      // uml
+      if (m_unix_sockets.find(fd) != m_unix_sockets.end()) {
+        m_unix_sockets.erase(fd);
+        m_async_sockets.erase(fd);
+        m_sockets.erase(fd);
+        availableFDs.insert(fd);
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+
       Ptr<Socket> sock = m_sockets.at(fd);
       sock->Close();
 
@@ -708,9 +772,9 @@ struct GrailApplication::Priv
       m_connectedSockets.erase(fd);
       m_isListenTcpSocket.erase(fd);
       m_nonblocking_sockets.erase(fd);
-      
+
       availableFDs.insert(fd);
-      
+
       // we must delay the deletion of the socket, since the DataSent callback may fail otherwise
       // the constant delay of one second likely includes a large safety margin
       std::function<void()> removeClosedSocket = [sock]()
@@ -737,7 +801,7 @@ struct GrailApplication::Priv
     }
   }
 
-  
+
   // int open(const char *pathname, int flags);
   // int open(const char *pathname, int flags, mode_t mode);
   SyscallHandlerStatusCode HandleOpen() {
@@ -799,19 +863,69 @@ struct GrailApplication::Priv
     
     NS_LOG_LOGIC(pid << ": (" << Simulator::Now().GetSeconds() << "s) [fcntl cmd]: "
                  << fcntlname(cmd) << " on fd: " << fd);
-    if(cmd == F_SETFL && m_netlinks.find(fd) != m_netlinks.end()) {
-      // todo: ignore for now (hoping that it works)
+    if(cmd == F_SETOWN) {
+      if (m_sockets.find(fd) != m_sockets.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+      if (m_random_fds.find(fd) != m_random_fds.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+    }
+    if(cmd == F_SETSIG) {
+      if (m_sockets.find(fd) != m_sockets.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+      if (m_random_fds.find(fd) != m_random_fds.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+    }
+    if(cmd == F_GETFD && m_sockets.find(fd) != m_sockets.end()) {
       FAKE(0);
       return SYSC_SUCCESS;
     }
-    if(cmd == F_GETFL && m_sockets.find(fd) != m_sockets.end()) {
+    if(cmd == F_SETFD && m_sockets.find(fd) != m_sockets.end()) {
       FAKE(0);
       return SYSC_SUCCESS;
+    }
+    if(cmd == F_SETFL) {
+      // todo: ignore for now (hoping that it works)
+      if (m_sockets.find(fd) != m_sockets.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+      if (m_random_fds.find(fd) != m_random_fds.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+    }
+    if(cmd == F_GETFL) {
+      if (m_sockets.find(fd) != m_sockets.end()) {
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+      if (m_random_fds.find(fd) != m_random_fds.end()) {
+        // TODO: set O_RDONLY|O_LARGEFILE
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
     }
     if(cmd == F_SETFL && m_sockets.find(fd) != m_sockets.end()) {
       int flags;
       read_args3(pid, flags);
       NS_LOG_LOGIC("fcntl/" << fcntlname(cmd) << ": " << " flags: " << flags);
+
+      if(m_unix_sockets.find(fd) != m_unix_sockets.end()) {
+        NS_LOG_LOGIC("fcntl unix socket");
+        if (flags & FASYNC)
+          m_async_sockets.insert(fd);
+        FAKE(0);
+        return SYSC_SUCCESS;
+      }
+
       if(flags == O_NONBLOCK) {
         if(!m_nonblocking_sockets.count(fd)) m_nonblocking_sockets.insert(fd);
         FAKE(0);
@@ -824,6 +938,7 @@ struct GrailApplication::Priv
       }
       UNSUPPORTED("unknown fctl flag: " << flags);
     }
+    NS_LOG_LOGIC("did not find a handler");
     return SYSC_ERROR;
   }
 
@@ -833,7 +948,7 @@ struct GrailApplication::Priv
     unsigned long request;
     // ???va_arg???;
     read_args(pid, fd, request);
-    
+
     if(fd == 1 && request == TCGETS) {
       FAKE(-1);
       return SYSC_FAILURE;
@@ -841,6 +956,11 @@ struct GrailApplication::Priv
     
     if(!FdIsEmulatedSocket(fd)) {
       return HandleSyscallAfter();
+    }
+
+    if (request == TCGETS) {
+      FAKE(-ENOTTY);
+      return SYSC_FAILURE;
     }
     
     if(request == SIOCGIFFLAGS) {
@@ -1015,12 +1135,43 @@ struct GrailApplication::Priv
       if((fd == 1 || fd == 2) && app->m_printStdout) {
         printf("%2.2f/%d: %s", Simulator::Now().GetSeconds(), pid, mystr);
       }
-    
+
       FAKE(count);
       return SYSC_SUCCESS;
     } else {
       if(!m_connectedSockets.count(fd)) {
         UNSUPPORTED("write on emulated socket, but it is not a connected TCP socket");
+      }
+
+      if (m_unix_sockets.find(fd) != m_unix_sockets.end()) {
+        NS_LOG_LOGIC(pid << ": [EE] write to fd " << fd);
+        uint8_t *mystr;
+
+        if (m_daemon_ctl_sockets.find(fd) != m_daemon_ctl_sockets.end()) {
+          void *sun = malloc(ALIGN(110 * sizeof(uint8_t)));
+          mystr = (uint8_t*)std::get<0>(m_unix_sockets[fd]);
+
+          memcpy (mystr, sun, sizeof(&sun));
+          std::get<1>(m_unix_sockets[fd]) = 110;
+        }
+        else {
+          mystr = (uint8_t*)std::get<0>(m_unix_sockets[fd]);
+          std::get<1>(m_unix_sockets[fd]) = count;
+        }
+
+        MemcpyFromTracee(pid, mystr, str, count);
+
+        // debug printing
+        //printf("Unix socket write: ");
+        //char* buffy = (char*)mystr;
+        //for (int i = 0; i<110; ++i) {
+          //printf("%02X ", buffy[i]);
+        //}
+        //printf("\n");
+        // debug printing - end
+
+        FAKE(count);
+        return SYSC_SUCCESS;
       }
 
       uint32_t txAvailable = m_sockets.at(fd)->GetTxAvailable();
@@ -1035,9 +1186,9 @@ struct GrailApplication::Priv
           {
             UNSUPPORTED("blocking wait");
           };
-        
+
         m_sockets.at(fd)->SetSendCallback(MakeFunctionCallback(sendCallback));
-        return SYSC_DELAYED; 
+        return SYSC_DELAYED;
       }
       size_t towrite = (count < txAvailable ? count : txAvailable);
       uint8_t mystr[towrite];
@@ -1161,10 +1312,24 @@ struct GrailApplication::Priv
         return SYSC_ERROR;
       }
     }
+    else if (domain == AF_UNIX) {
+      int new_socket_fd;
+      //if ((type == SOCK_DGRAM) || (type == SOCK_STREAM)) {
+        void *buf = malloc(ALIGN(unix_socket_buf_size));
+        new_socket_fd = GetNextFD();
+        m_sockets[new_socket_fd] = NULL;
+        m_unix_sockets[new_socket_fd] = std::make_tuple(buf, -1);
+        FAKE(new_socket_fd);
+        return SYSC_SUCCESS;
+      //}
+      //else {
+        //NS_LOG_WARN(pid << ": [EE] socket(2) unimplemented UNIX socket type " << type << ".");
+        //FAKE(-EAFNOSUPPORT);
+        //return SYSC_FAILURE;
+      //}
+    }
     else {
-      if(domain == AF_UNIX) 
-        NS_LOG_WARN(pid << ": [EE] socket(2): domain AF_UNIX not supported.");
-      else if(domain == AF_LOCAL) 
+      if(domain == AF_LOCAL) 
         NS_LOG_WARN(pid << ": [EE] socket(2): domain AF_LOCAL not supported.");
       else if(domain == AF_INET6) 
         NS_LOG_WARN(pid << ": [EE] socket(2): domain AF_INET6 not supported.");
@@ -1232,6 +1397,29 @@ struct GrailApplication::Priv
       return SYSC_FAILURE;
     }
     
+    if(m_unix_sockets.find(sockfd) != m_unix_sockets.end()) {
+      // uml
+      // handle unix socket
+      struct sockaddr myaddr;
+      LoadFromTracee(pid, &myaddr, addr);
+      if (myaddr.sa_family != AF_UNIX) {
+        return SYSC_ERROR;
+      }
+      std::regex daemon_regex("uml.ctl");
+      if (std::regex_search(myaddr.sa_data, daemon_regex)) {
+        NS_LOG_LOGIC(pid << ": connect fd " << sockfd << " to network daemon control.");
+
+        m_daemon_ctl_sockets.insert(sockfd);
+        m_connectedSockets.insert(sockfd);
+
+        FAKE(0);
+        return SYSC_SUCCESS;
+      } else {
+        FAKE(-ENOENT);
+        return SYSC_FAILURE;
+      }
+    }
+
     std::shared_ptr<Address> ns3addr = GetNs3Address(addr,addrlen);
     if(!ns3addr) {
       return SYSC_ERROR;
@@ -1279,7 +1467,7 @@ struct GrailApplication::Priv
       if (optname == SO_SNDBUF) {
         UintegerValue bufSizeValue;
         m_sockets.at(sockfd)->GetAttribute("SndBufSize", bufSizeValue);
-        
+
         int myoptval       = bufSizeValue.Get();
         socklen_t myoptlen = sizeof(myoptlen);
         MemcpyToTracee(pid, optval, &myoptval, myoptlen);
@@ -1355,7 +1543,7 @@ struct GrailApplication::Priv
         Ptr<TcpSocket> tcpSock = DynamicCast<TcpSocket>(m_sockets.at(sockfd));
         UintegerValue value;
         tcpSock->GetAttribute("SegmentSize", value);
-        
+
         int myoptval       = value.Get();
         socklen_t myoptlen = sizeof(myoptlen);
         MemcpyToTracee(pid, optval, &myoptval, myoptlen);
@@ -1381,7 +1569,7 @@ struct GrailApplication::Priv
       FAKE(-ENOPROTOOPT);
       return SYSC_FAILURE;
     }
-    
+
     UNSUPPORTED("not implemented");
   }
 
@@ -1472,7 +1660,7 @@ struct GrailApplication::Priv
       return SYSC_FAILURE;
     }
   }
-  
+
   //ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
   //               const struct sockaddr *dest_addr, socklen_t addrlen);
   SyscallHandlerStatusCode HandleSendTo() {
@@ -1491,7 +1679,50 @@ struct GrailApplication::Priv
     NS_LOG_LOGIC(pid << ": [EE] socket with flags: " << flags);
     NS_LOG_LOGIC(pid << ": [EE] socket with dest_addr: " << dest_addr);
     NS_LOG_LOGIC(pid << ": [EE] socket with addrlen: " << addrlen);
-    
+
+    if (m_daemon_data_sockets.find(sockfd) != m_daemon_data_sockets.end()) {
+      void* mybuf = malloc(ALIGN(len));
+
+      MemcpyFromTracee(pid, mybuf, buf, len);
+      NS_LOG_LOGIC("Received packet from UML");
+
+      Ptr<Packet> packet = Create<Packet> (reinterpret_cast<const uint8_t *> (mybuf), len);
+      std::free (mybuf);
+      Address src, dst;
+      uint16_t type;
+
+      uint32_t pktSize = packet->GetSize();
+      EthernetHeader header (false);
+      if (pktSize < header.GetSerializedSize ()) {
+        NS_LOG_ERROR("packet unfit of ns-3 consumption");
+      }
+
+      uint32_t headerSize = packet->PeekHeader (header);
+      packet->RemoveAtStart (headerSize);
+
+      NS_LOG_LOGIC("Pkt source is " << header.GetSource ());
+      NS_LOG_LOGIC("Pkt destination is " << header.GetDestination ());
+      NS_LOG_LOGIC("Pkt LengthType is " << header.GetLengthType ());
+
+      src = header.GetSource ();
+      dst = header.GetDestination ();
+      type = header.GetLengthType ();
+
+      m_daemon_netdevice[sockfd]->SetAddress (src);
+      bool ret = m_daemon_netdevice[sockfd]->Send (packet, dst, type);
+      NS_LOG_LOGIC (PNAME << ": [" << Simulator::Now().GetSeconds() << "s] Send-Result: " << ret);
+
+      Ptr<Queue<Packet> > queue = StaticCast<CsmaNetDevice> (m_daemon_netdevice[sockfd])->GetQueue ();
+      NS_LOG_ERROR (PNAME << ": [" << Simulator::Now().GetSeconds() << "s] SEND Packets: " << queue->GetNPackets ());
+
+      if (!ret) {
+        FAKE(-EAGAIN);
+        return SYSC_FAILURE;
+      }
+      FAKE(len);
+      return SYSC_SUCCESS;
+    }
+
     if(m_sockets.find(sockfd) != m_sockets.end()) {
       int flags_left = flags;
       int ns3flags = 0;
@@ -1500,7 +1731,7 @@ struct GrailApplication::Priv
         ns3flags |= MSG_DONTROUTE;
         flags_left -= MSG_DONTROUTE;
       }
-      
+
       if(flags_left) {
         NS_LOG_ERROR("unknown socket flags: " << flags);
         return SYSC_ERROR;
@@ -1515,11 +1746,11 @@ struct GrailApplication::Priv
       } else {
         ns3addr = std::make_shared<Address>();
       }
-    
+
       Ptr<Socket> socket = m_sockets.at(sockfd);
       int ret = socket->SendTo((uint8_t*)_buf, len, ns3flags, *ns3addr);
       free(_buf);
-      
+
       FAKE(ret);
       return SYSC_SUCCESS;
     }
@@ -1961,7 +2192,7 @@ struct GrailApplication::Priv
       return SYSC_DELAYED;
     }
   }
-  
+
   // ssize_t recvfrom(int socket, void *restrict buffer, size_t length,
   //                  int flags, struct sockaddr *restrict address,
   //                  socklen_t *restrict address_len);
@@ -1982,12 +2213,26 @@ struct GrailApplication::Priv
     NS_LOG_LOGIC(pid << ": [EE] socket with flags: " << flags);
     NS_LOG_LOGIC(pid << ": [EE] socket with address: " << address);
     NS_LOG_LOGIC(pid << ": [EE] socket with address_len: " << address_len);
-          
- 
+
     if(m_sockets.find(socket) == m_sockets.end()) {
       NS_LOG_ERROR("could not find ns-3 socket for file descriptor " << socket);
       return SYSC_ERROR;
     }
+
+    if (m_unix_sockets.find(socket) != m_unix_sockets.end()) {
+      uint8_t* mybuf = (uint8_t*)std::get<0>(m_unix_sockets[socket]);
+      int length = std::get<1>(m_unix_sockets[socket]);
+      if (length < 0) {
+        FAKE(-EAGAIN);
+        return SYSC_FAILURE;
+      }
+
+      MemcpyToTracee(pid, buffer, (void*)mybuf, length);
+      std::get<1>(m_unix_sockets[socket]) = -1; // "empty" buffer
+      FAKE(length);
+      return SYSC_SUCCESS;
+    }
+
     Ptr<Socket> ns3socket = m_sockets.at(socket);
 
     if(flags != 0 && ns3socket->GetObject<TcpSocketBase>()) {
@@ -2072,48 +2317,10 @@ struct GrailApplication::Priv
       } while(0);
       ProcessStatusCode(res, SYS_nanosleep);
     };
-
-    nextEvent = Simulator::Schedule(Seconds(_req->tv_sec)+NanoSeconds(_req->tv_nsec), MakeFunctionalEvent(cb));
+    
+    Simulator::Schedule(Seconds(_req->tv_sec)+NanoSeconds(_req->tv_nsec), MakeFunctionalEvent(cb));
 
     free(_req);
-    return SYSC_DELAYED;
-  }
-
-  // int clock_nanosleep(clockid_t clockid, int flags,
-  //                     const struct timespec *request,
-  //                     struct timespec *remain);
-  SyscallHandlerStatusCode HandleClockNanoSleep() {
-    clockid_t clockid;
-    int flags;
-    struct timespec *request;
-    // struct timespec *remain;
-
-    read_args(pid, clockid, flags, request/*, remain*/);
-
-    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC) {
-      NS_LOG_ERROR(PNAME << ": [EE] unsupported clock type: " << clockid);
-      return SYSC_ERROR;
-    }
-
-    if (flags != 0) {
-      NS_LOG_ERROR(PNAME << ": [EE] unsupported clock flags: " << flags);
-      return SYSC_ERROR;
-    }
-
-    struct timespec* myrequest = (timespec*)malloc(ALIGN(sizeof(struct timespec)));
-    MemcpyFromTracee(pid, myrequest, request, sizeof(struct timespec));
-
-    std::function<void()> cb = [this](){
-      SyscallHandlerStatusCode res = SYSC_SUCCESS;
-      do {
-        FAKE2(0);
-      } while(0);
-      ProcessStatusCode(res, SYS_clock_nanosleep);
-    };
-
-    nextEvent = Simulator::Schedule(Seconds(myrequest->tv_sec)+NanoSeconds(myrequest->tv_nsec), MakeFunctionalEvent(cb));
-
-    free(myrequest);
     return SYSC_DELAYED;
   }
   
@@ -2153,28 +2360,28 @@ struct GrailApplication::Priv
   }
 
   // int clock_gettime(clockid_t clk_id, struct timespec *tp);
-  SyscallHandlerStatusCode HandleClockGetTime() {
-    clockid_t clk_id;
-    struct timespec *tp;
-    read_args(pid, clk_id, tp);
-    struct timespec mytp;
-    LoadFromTracee(pid, &mytp, tp);
+    SyscallHandlerStatusCode HandleClockGetTime() {
+      clockid_t clk_id;
+      struct timespec *tp;
+      read_args(pid, clk_id, tp);
+      struct timespec mytp;
+      LoadFromTracee(pid, &mytp, tp);
 
-    // check for unspported clocks
-    if(clk_id == CLOCK_PROCESS_CPUTIME_ID || clk_id == CLOCK_THREAD_CPUTIME_ID) {
-      FAKE(-1);
-      return SYSC_FAILURE;
+      // check for unspported clocks
+      if(clk_id == CLOCK_PROCESS_CPUTIME_ID || clk_id == CLOCK_THREAD_CPUTIME_ID) {
+        FAKE(-1);
+        return SYSC_FAILURE;
+      }
+      
+      mytp.tv_sec  = Simulator::Now().ToInteger(Time::S);
+      mytp.tv_nsec = Simulator::Now().ToInteger(Time::NS) - (long)(mytp.tv_sec) * 1000000000;
+      
+      StoreToTracee(pid, &mytp, tp);
+      return SYSC_SUCCESS;
     }
-    
-    mytp.tv_sec  = Simulator::Now().ToInteger(Time::S);
-    mytp.tv_nsec = Simulator::Now().ToInteger(Time::NS) - (long)(mytp.tv_sec) * 1000000000;
-    
-    StoreToTracee(pid, &mytp, tp);
-    return SYSC_SUCCESS;
-  }
 
-  // int clock_getres(clockid_t clk_id, struct timespec *res);
-  SyscallHandlerStatusCode HandleClockGetRes() {
+    // int clock_getres(clockid_t clk_id, struct timespec *res);
+    SyscallHandlerStatusCode HandleClockGetRes() {
     clockid_t clk_id;
     struct timespec *res;
     read_args(pid, clk_id, res);
@@ -2195,14 +2402,37 @@ struct GrailApplication::Priv
   }
 
   // int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-  SyscallHandlerStatusCode HandleBind() {
+  SyscallHandlerStatusCode HandleBind()
+  {
     int sockfd;
     struct sockaddr* addr;
     socklen_t addrlen;
 
     read_args(pid, sockfd, addr, addrlen);
 
-    if(m_sockets.find(sockfd) != m_sockets.end()) {
+    if (m_unix_sockets.find(sockfd) != m_unix_sockets.end()) {
+      // TODO: we assume that unix sockets in combination with bind are network
+      // daemon data sockets
+      m_daemon_data_sockets.insert(sockfd);
+      m_connectedSockets.insert(sockfd);
+
+      int daemon_netdevice_id = daemon_data_socket_count++;
+      if ((int)app->GetNode()->GetNDevices() < daemon_netdevice_id) {
+        NS_LOG_ERROR("no net devices left");
+        return SYSC_ERROR;
+      }
+      Ptr<ns3::NetDevice> device;
+      device = app->GetNode()->GetDevice(daemon_netdevice_id);
+      device->SetReceiveCallback (MakeCallback (&ns3::GrailApplication::Priv::DiscardFromDevice, this));
+      device->SetPromiscReceiveCallback (MakeCallback (&ns3::GrailApplication::Priv::ReceiveFromDevice, this));
+      m_daemon_netdevice[sockfd] = device;
+      Ptr<Queue<Packet> > queue = StaticCast<CsmaNetDevice> (m_daemon_netdevice[sockfd])->GetQueue ();
+
+      NS_LOG_LOGIC(PNAME << ": [EE] created new network bridge! Device: " << device);
+      FAKE(0);
+      return SYSC_SUCCESS;
+    }
+    else if(m_sockets.find(sockfd) != m_sockets.end()) {
       std::shared_ptr<Address> ns3addr = GetNs3Address(addr,addrlen);
       if(!ns3addr) {
         return SYSC_ERROR;
@@ -2277,41 +2507,9 @@ struct GrailApplication::Priv
     return SYSC_SUCCESS;
   }
 
-  void AlarmEventHelper() {
-
-    if (delayedEventSyscallNumber > -1) {
-      NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
-                    << "s] delayed function canceled.");
-      FAKE3(-EINTR);
-    }
-
-    nextEvent.Cancel ();
-    nextEvent = Simulator::ScheduleNow(&Priv::HandleSyscallBefore, this);
-
-    NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
-                  << "s] send signal SIGALRM to process.");
-    kill (pid, SIGALRM);
-  }
-
-  // unsigned int alarm(unsigned int seconds);
-  SyscallHandlerStatusCode HandleAlarm() {
-    unsigned int seconds;
-
-    read_args (pid, seconds);
-
-    Time timeLeft = Seconds (0);
-    if (alarmTime > Simulator::Now ()) {
-      alarmEvent.Cancel ();
-      timeLeft = alarmTime - Simulator::Now ();
-    }
-    alarmEvent = Simulator::Schedule (Seconds (seconds), &ns3::GrailApplication::Priv::AlarmEventHelper, this);
-
-    FAKE((unsigned)(timeLeft.GetSeconds ()));
-    return SYSC_SUCCESS;
-  }
-
   //int timer_create (clockid_t clockid, struct sigevent *sevp, timer_t *timerid);
-  SyscallHandlerStatusCode HandleTimerCreate() {
+  SyscallHandlerStatusCode HandleTimerCreate()
+  {
     clockid_t clockid;
     struct sigevent *sevp;
     timer_t *timerid;
@@ -2337,95 +2535,65 @@ struct GrailApplication::Priv
     NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds()
                  << "s] Create new timer with ID " << timer_count);
 
-    *(int*)mytimerid = timer_count++;
+    *(long*)mytimerid = timer_count++;
     StoreToTracee(pid, &mytimerid, timerid);
 
     FAKE(0);
     return SYSC_SUCCESS;
   }
 
-  // int timer_delete(timer_t timerid);
-  SyscallHandlerStatusCode HandleTimerDelete() {
-    timer_t timerid;
-    read_args(pid, timerid);
-
-    int mytimerid = *(int*)timerid;
-    if (mytimerid >= timer_count)
-    {
-      FAKE(-EINVAL);
-      return SYSC_FAILURE;
-    }
-
-    m_timerEvents[mytimerid].Cancel ();
-    m_timerIntervals[mytimerid] = Seconds (0);
-    m_timerValues[mytimerid] = Seconds (0);
-
-    FAKE(0);
-    return SYSC_SUCCESS;
-  }
-
-  void IntervalTimerEventHelper(int timerid) {
+  //timer_interval helper function
+  SyscallHandlerStatusCode IntervalTimerHelper(int timerid)
+  {
     NS_LOG_FUNCTION (this << pid << timerid << Simulator::Now().GetSeconds());
+    SyscallHandlerStatusCode res = SYSC_FAILURE;
 
-    if (delayedEventSyscallNumber > 0)
+    if (delayedEvent.IsExpired() == false)
     {
-      NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
-                   << "s] delayed function canceled.");
-      FAKE3(-EINTR);
+      NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds()
+                   << "s] delayed function canceled. syscall: "
+                   << syscname(delayedSyscallNumber));
+      delayedEvent.Cancel();
+      FAKE(-EINTR);
+      ProcessStatusCode(res, delayedSyscallNumber);
+    //}
+
+    kill(pid, SIGALRM);
+    ptrace(PTRACE_SYSCALL, pid, 0, SIGALRM);
+    waitpid(pid, 0, 0);
+
+
     }
-
-    nextEvent.Cancel ();
-    nextEvent = Simulator::ScheduleNow(&Priv::HandleSyscallBefore, this);
-
-    NS_LOG_LOGIC (PNAME << ": [EE] [" << Simulator::Now ().GetSeconds ()
-                  << "s] send signal SIGALRM to process.");
-    kill (pid, SIGALRM);
-
     if ( ! m_timerIntervals[timerid].IsZero ())
     {
       m_timerEvents[timerid] = Simulator::Schedule(m_timerIntervals[timerid],
-                                                   &ns3::GrailApplication::Priv::IntervalTimerEventHelper,
+                                                   &ns3::GrailApplication::Priv::IntervalTimerHelper,
                                                    this, timerid);
     }
+    return res;
   }
 
   //int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value, struct itimerspec *old_value);
-  SyscallHandlerStatusCode HandleTimerSettime() {
+  SyscallHandlerStatusCode HandleTimerSettime()
+  {
     timer_t timerid;
     int flags;
     struct itimerspec *new_value;
     struct itimerspec *old_value;
-    struct itimerspec mynew_value;
-    struct itimerspec myold_value;
 
     read_args(pid, timerid, flags, new_value, old_value);
+    long mytimerid = *(long*)timerid;
 
-    int mytimerid = *(int*)timerid;
+    NS_LOG_LOGIC(pid << ": [EE] Timer ID: " << mytimerid << " old value: " << old_value << " new value: " << new_value);
+
     if (mytimerid >= timer_count)
     {
       FAKE(-EINVAL);
       return SYSC_FAILURE;
     }
 
-    if (new_value == NULL)
-    {
-      FAKE(-EFAULT);
-      return SYSC_FAILURE;
-    }
+    struct itimerspec mynew_value;
     LoadFromTracee(pid, &mynew_value, new_value);
-
-    if (old_value != NULL)
-    {
-      Time rem = Simulator::GetDelayLeft (m_timerEvents[mytimerid]);
-      Time ivl = m_timerIntervals[mytimerid];
-
-      myold_value.it_interval.tv_sec =  ivl.ToInteger (Time::S);
-      myold_value.it_interval.tv_nsec = ivl.ToInteger (Time::NS) - (ivl.ToInteger(Time::S) * 1000000000);
-      myold_value.it_value.tv_sec = rem.ToInteger (Time::S);
-      myold_value.it_value.tv_nsec = rem.ToInteger (Time::NS) - (rem.ToInteger(Time::S) * 1000000000);
-
-      StoreToTracee (pid, &myold_value, old_value);
-    }
 
     time_t value_time_sec = mynew_value.it_value.tv_sec;
     long value_time_nsec = mynew_value.it_value.tv_nsec;
@@ -2445,7 +2613,7 @@ struct GrailApplication::Priv
                    << "s] arm timer " << mytimerid << " to trigger in: "
                    << value_time);
       m_timerEvents[mytimerid] = Simulator::Schedule(value_time,
-                                                     &ns3::GrailApplication::Priv::IntervalTimerEventHelper,
+                                                     &ns3::GrailApplication::Priv::IntervalTimerHelper,
                                                      this, mytimerid);
     }
 
@@ -2453,127 +2621,108 @@ struct GrailApplication::Priv
     return SYSC_SUCCESS;
   }
 
-  // int timer_gettime(timer_t timerid, struct itimerspec *curr_value);
-  SyscallHandlerStatusCode HandleTimerGettime() {
+  // int timer_delete(timer_t timerid);
+  SyscallHandlerStatusCode HandleTimerDelete()
+  {
     timer_t timerid;
-    struct itimerspec *curr_value;
-    struct itimerspec mycurr_value;
+    read_args(pid, timerid);
 
-    read_args(pid, timerid, curr_value);
-
-    int mytimerid = *(int*)timerid;
+    long mytimerid = *(long*)timerid;
     if (mytimerid >= timer_count)
     {
       FAKE(-EINVAL);
       return SYSC_FAILURE;
     }
 
-    if (curr_value == NULL)
-    {
-      FAKE(-EFAULT);
-      return SYSC_FAILURE;
-    }
-
-    Time rem = Simulator::GetDelayLeft (m_timerEvents[mytimerid]);
-    Time ivl = m_timerIntervals[mytimerid];
-    mycurr_value.it_interval.tv_sec =  ivl.ToInteger (Time::S);
-    mycurr_value.it_interval.tv_nsec = ivl.ToInteger (Time::NS) - (ivl.ToInteger(Time::S) * 1000000000);
-    mycurr_value.it_value.tv_sec = rem.ToInteger (Time::S);
-    mycurr_value.it_value.tv_nsec = rem.ToInteger (Time::NS) - (rem.ToInteger(Time::S) * 1000000000);
-
-    StoreToTracee (pid, &mycurr_value, curr_value);
+    m_timerEvents[mytimerid].Cancel ();
+    m_timerIntervals[mytimerid] = Seconds (0);
+    m_timerValues[mytimerid] = Seconds (0);
 
     FAKE(0);
     return SYSC_SUCCESS;
   }
 
   // int epoll_create(int size);
-  SyscallHandlerStatusCode HandleEpollCreate() {
-    int size;
-
-    read_args(pid, size);
-
-    if (size < 1) {
-      FAKE(-EINVAL);
-      return SYSC_FAILURE;
-    }
-
-    int newEpollFd = GetNextFD();
-    m_epoll_fds.insert(newEpollFd);
-    FAKE(newEpollFd);
+  // int epoll_create1(int flags);
+  SyscallHandlerStatusCode HandleEpollCreate()
+  {
+    int new_epoll_fd = GetNextFD();
+    m_epoll_fds.insert(new_epoll_fd);
+    FAKE(new_epoll_fd);
     return SYSC_SUCCESS;
   }
 
   // int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
-  SyscallHandlerStatusCode HandleEpollCtl() {
+  SyscallHandlerStatusCode HandleEpollCtl()
+  {
     int epfd;
     int op;
     int fd;
     struct epoll_event *event;
-
     read_args(pid, epfd, op, fd, event);
 
+    NS_LOG_LOGIC(PNAME << ": [EE] EpollCtl epfd: " << epfd << ", op: " << op << ", fd: " << fd);
+
     if (m_epoll_fds.find(epfd) == m_epoll_fds.end()) {
-      FAKE (-EINVAL);
+      NS_LOG_LOGIC(PNAME << ": [EE] not an epfd");
+      FAKE(-EBADF);
+      return SYSC_FAILURE;
+    }
+
+    if ((fd == 0) || (fd == 1)) {
+      FAKE(0);
+      return SYSC_SUCCESS;
+    }
+
+    if (m_unix_sockets.find(fd) == m_unix_sockets.end()) {
+      NS_LOG_LOGIC(PNAME << ": [EE] fd not a unix socket");
+      FAKE(-EBADF);
       return SYSC_FAILURE;
     }
 
     if (op == EPOLL_CTL_DEL) {
-      if (m_epoll_data.find(fd) == m_epoll_data.end()) {
+      if (m_epoll_events.find(fd) == m_epoll_events.end()) {
         FAKE(-ENOENT);
         return SYSC_FAILURE;
       }
-      m_epoll_data.erase(fd);
-      FAKE(0);
-      return SYSC_SUCCESS;
-    } else if(op == EPOLL_CTL_ADD) {
-      if (m_epoll_data.find(fd) != m_epoll_data.end()) {
-        FAKE(-EEXIST);
-        return SYSC_FAILURE;
-      }
-      struct epoll_event myevent;
-      LoadFromTracee(pid, &myevent, event);
-      m_epoll_data[fd] = myevent.data;
+      m_epoll_events.erase(fd);
       FAKE(0);
       return SYSC_SUCCESS;
     }
 
-    UNSUPPORTED("unsupported epoll operation: " << op);
+    else if(op == EPOLL_CTL_ADD) {
+      struct epoll_event myevent;
+      LoadFromTracee(pid, &myevent, event);
+      m_epoll_events[fd] = myevent;
+      NS_LOG_INFO(pid << "add event for fd " << fd);
+      FAKE(0);
+      return SYSC_SUCCESS;
+    }
+
+    UNSUPPORTED("unknown epoll operation: " << op);
     return SYSC_ERROR;
   }
 
   // int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int
-  // timeout
-  SyscallHandlerStatusCode HandleEpollWait() {
+  // timeout)
+  SyscallHandlerStatusCode HandleEpollWait()
+  {
     int epfd;
     struct epoll_event *events;
     int maxevents;
     int timeout;
-
     read_args(pid, epfd, events, maxevents, timeout);
 
-    if (maxevents < 1) {
-      FAKE(-EINVAL);
-      return SYSC_FAILURE;
-    }
-
-    if (timeout != 0) {
-      UNSUPPORTED ("epoll_wait(2) calls with timout");
-      return SYSC_ERROR;
-    }
-
     if (m_epoll_fds.find(epfd) == m_epoll_fds.end()) {
-      FAKE(-EINVAL);
+      NS_LOG_LOGIC(pid << ": bad epfd");
+      FAKE(-EBADF);
       return SYSC_FAILURE;
     }
-
-    std::map<int, epoll_data>::iterator it = m_epoll_data.begin();
-    for (; it != m_epoll_data.end(); ++it) {
+    std::map<int, epoll_event>::iterator it = m_epoll_events.begin();
+    for (; it != m_epoll_events.end(); ++it) {
       if (m_unpolled_events.find(it->first) != m_unpolled_events.end()) {
-        struct epoll_event myevent;
-        myevent.events = EPOLLIN;
-        myevent.data = it->second;
-        StoreToTracee(pid, &myevent, events);
+        struct epoll_event _event = it->second;
+        StoreToTracee(pid, &_event, events);
         m_unpolled_events.erase(it->first);
         FAKE(1);
         return SYSC_SUCCESS;
@@ -2584,59 +2733,24 @@ struct GrailApplication::Priv
     return SYSC_SUCCESS;
   }
 
-  // ssize_t pread(int fd, void *buf, size_t count, off_t offset);
-  SyscallHandlerStatusCode HandlePread64() {
-    int fd;
-    read_args(pid, fd);
-
-    if (! FdIsEmulatedSocket(fd))
-    {
-      return HandleSyscallAfter();
-    }
-
-    UNSUPPORTED("read from emulated fd");
-    return SYSC_ERROR;
-  }
-
-  // ssize_t pwrite(int fd, void *buf, size_t count, off_t offset);
-  SyscallHandlerStatusCode HandlePwrite64() {
-    int fd;
-
-    read_args(pid, fd);
-    if (! FdIsEmulatedSocket(fd))
-    {
-      return HandleSyscallAfter();
-    }
-
-    UNSUPPORTED("write to emulated fd");
-    return SYSC_ERROR;
-  }
-
   // int socketpair(int domain, int type, int protocol, int sv[2])
-  SyscallHandlerStatusCode HandleSocketPair() {
+  SyscallHandlerStatusCode HandleSocketPair()
+  {
     int domain;
     int type;
     int protocol;
     int sv[2];
     int *svPtr = sv;
-
     read_args(pid, domain, type, protocol, svPtr);
 
     if (domain != AF_UNIX)
-    {
       UNSUPPORTED("unsupported oscket domain " << domain);
-      return SYSC_ERROR;
-    }
 
     if (type != SOCK_STREAM)
-    {
       UNSUPPORTED("unsupported socket type " << type);
-      return SYSC_ERROR;
-    }
 
     int mysv[2];
     int *mysvPtr = mysv;
-
     void *buf_1 = malloc(ALIGN(unix_socket_buf_size));
     mysv[0] = GetNextFD();
     m_sockets[mysv[0]] = NULL;
@@ -2651,13 +2765,185 @@ struct GrailApplication::Priv
 
     m_unix_pairs[mysv[0]] = mysv[1];
     m_unix_pairs[mysv[1]] = mysv[0];
+    NS_LOG_INFO("new socketpair FDs: " << mysv[0] << ", " << mysv[1]);
+
     MemcpyToTracee(pid, svPtr, mysvPtr, sizeof(mysv));
 
     FAKE(0);
     return SYSC_SUCCESS;
   }
 
-  Ptr<NetDevice> GetNetDeviceByName(const std::string& ifname) {
+  // ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+  SyscallHandlerStatusCode HandlePread64()
+  {
+    int fd;
+
+    read_args(pid, fd);
+    if (! FdIsEmulatedSocket(fd))
+      return HandleSyscallAfter();
+
+    UNSUPPORTED("pread: read from emulated fd not supported!");
+    return SYSC_ERROR;
+  }
+
+  // ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
+  SyscallHandlerStatusCode HandlePwrite64()
+  {
+    int fd;
+
+    read_args(pid, fd);
+    if (! FdIsEmulatedSocket(fd))
+      return HandleSyscallAfter();
+
+    UNSUPPORTED("pwrite: write to emulated fd not supported!");
+    return SYSC_ERROR;
+  }
+
+  // int clock_nanosleep(clockid_t clockid, int flags,
+  //                     const struct timespec *request,
+  //                     struct timespec *remain);
+  SyscallHandlerStatusCode HandleClockNanoSleep()
+  {
+    clockid_t clockid;
+    int flags;
+    struct timespec *request;
+    struct timespec *remain;
+
+    read_args(pid, clockid, flags, request, remain);
+
+    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC) {
+      FAKE(-1);
+      return SYSC_FAILURE;
+    }
+
+    struct timespec _request;
+    MemcpyFromTracee(pid, &_request,request,sizeof(_request));
+
+    std::function<void()> cb = [this](){
+      SyscallHandlerStatusCode res = SYSC_SUCCESS;
+      do {
+        FAKE2(0);
+      } while(0);
+      ProcessStatusCode(res, SYS_nanosleep);
+    };
+
+    delayedEvent = Simulator::Schedule(Seconds(_request.tv_sec)+NanoSeconds(_request.tv_nsec), MakeFunctionalEvent(cb));
+    delayedSyscallNumber = SYS_clock_nanosleep;
+
+    return SYSC_DELAYED;
+  }
+
+
+  //long ptrace(enum __ptrace_request request, pid_t pid,
+  //            void *addr, void *data);
+  SyscallHandlerStatusCode HandlePtrace() {
+    enum __ptrace_request request;
+    pid_t ppid;
+    void* addr;
+    void* data;
+
+    read_args(pid, request, ppid, addr, data);
+    if (request != 12) {
+      return HandleSyscallAfter();
+    }
+    SyscallHandlerStatusCode ret = HandleSyscallAfter();
+    unsigned long long* _data;
+    _data = (unsigned long long*)malloc(ALIGN(27 * sizeof(unsigned long long)));
+    MemcpyFromTracee(pid, (void*)_data, data, 27 * sizeof(unsigned long long));
+    if (_data[15] <= 400) {
+      NS_LOG_LOGIC(pid << ": [EE] [" << Simulator::Now().GetSeconds() << "s] ptrace PID: " << ppid << ", orig_rax = " << syscname(_data[15]));
+    }
+
+    if(app->m_pollLoopDetection) {
+      Time t = pollLoopDetector.HandleSystemCall(pid, _data[15]);
+      if ( t > Seconds(0) ) {
+        NS_LOG_LOGIC(pid << ": [EE] [" << Simulator::Now().GetSeconds() << "s] poll loop detected, current delay: " << t);
+      }
+    }
+
+    return ret;
+  }
+
+
+  bool DiscardFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packet,
+                         uint16_t protocol, Address const &src)
+  {
+    NS_LOG_FUNCTION(device << packet << protocol << src);
+    NS_LOG_LOGIC("Discarding packet stolen from bridged device " << device);
+    return true;
+  }
+
+  bool ReceiveFromDevice(Ptr<NetDevice> device, Ptr<const Packet> packet,
+                         uint16_t protocol, const Address &src,
+                         const Address &dst, NetDevice::PacketType packetType)
+  {
+    NS_LOG_FUNCTION(device << packet << protocol << src << dst << packetType);
+    SyscallHandlerStatusCode res = SYSC_SUCCESS;
+    if (delayedEvent.IsExpired() == false) {
+      delayedEvent.Cancel();
+      NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds() << "s] delayed function canceled.");
+      set_reg(pid, orig_rax, SYS_getpid);
+      if (WaitForSyscall(pid) != 0) {
+        NS_LOG_ERROR("Failed replacing syscall with getpid(2).");
+      }
+      set_reg(pid, rax, -EINTR);
+      res = SYSC_FAILURE;
+      ProcessStatusCode(res, delayedSyscallNumber);
+    }
+
+    int data_fd;
+    std::set<int>::iterator it = m_daemon_data_sockets.begin();
+    for (; it != m_daemon_data_sockets.end(); it++) {
+      data_fd = *it;
+    }
+
+    uint8_t* mybuf = (uint8_t*)std::get<0>(m_unix_sockets[data_fd]);
+
+    Ptr<Packet> p = packet->Copy();
+    Mac48Address from = Mac48Address::ConvertFrom (src);
+    Mac48Address to = Mac48Address::ConvertFrom (dst);
+
+    EthernetHeader header (false);
+    header.SetSource (from);
+    header.SetDestination (to);
+    header.SetLengthType (protocol);
+    p->AddHeader (header);
+
+    p->CopyData(mybuf, p->GetSize ());
+    std::get<1>(m_unix_sockets[data_fd]) = p->GetSize();
+    m_unpolled_events.insert(data_fd);
+    NS_LOG_LOGIC(PNAME << ": [EE] UML got packet with length = " << p->GetSize() << " copied to device buffer " << data_fd);
+    kill(pid, SIGIO);
+    NS_LOG_LOGIC(PNAME << ": [EE] sent SIGIO");
+
+    return true;
+  }
+
+  // Linux shutdown helper
+  SyscallHandlerStatusCode ShutdownHelper (void)
+  {
+    NS_LOG_FUNCTION (this);
+    SyscallHandlerStatusCode res = SYSC_FAILURE;
+
+    if (delayedEvent.IsExpired() == false) {
+      NS_LOG_LOGIC(PNAME << ": [EE] [" << Simulator::Now().GetSeconds() << "s] delayed function canceled. syscall: " << syscname(delayedSyscallNumber));
+      delayedEvent.Cancel();
+      FAKE(-EINTR);
+      ProcessStatusCode(res, delayedSyscallNumber);
+    }
+
+    kill(pid, SIGINT);
+    ptrace(PTRACE_SYSCALL, pid, 0, SIGINT);
+    waitpid(pid, 0, 0);
+
+    return res;
+  }
+  
+
+  // Helper functions
+
+  Ptr<NetDevice> GetNetDeviceByName(const std::string& ifname)
+  {
     std::regex wlan_regex("^wlan");
     std::regex p2p_regex("^eth");
     if(std::regex_search(ifname, wlan_regex)) {
@@ -2692,7 +2978,8 @@ GrailApplication::GrailApplication ()
   p->rng = CreateObject<UniformRandomVariable> ();
   p->rng->SetAttribute("Min", DoubleValue(0.0));
   p->rng->SetAttribute("Max", DoubleValue(255.0));
-  p->egid = p->gid = p->euid = p->uid = 0; // root
+  //p->egid = p->gid = p->euid = p->uid = 0; // root
+  p->egid = p->gid = p->euid = p->uid = 1000; // root
 
 #define MAX_NUM_FDS 100
   for (int i=100; i<100+MAX_NUM_FDS; i++) {
@@ -2755,8 +3042,14 @@ void GrailApplication::StartApplication (void)
 void GrailApplication::StopApplication (void)
 {}
 
+void GrailApplication::SetShutdownTime (Time shutdown)
+{
+  NS_LOG_FUNCTION (this << shutdown);
+  m_kairosShutdownTime = shutdown;
+}
 
-int GrailApplication::Priv::DoTrace() {
+int GrailApplication::Priv::DoTrace()
+{
   int status, c;
   waitpid(pid, &status, 0);
   c = ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL);
@@ -2767,7 +3060,8 @@ int GrailApplication::Priv::DoTrace() {
   return 0;
 }
 
-bool fileExists(const std::string &file){
+bool fileExists(const std::string &file)
+{
   struct stat buf;
   return (stat(file.c_str(), &buf)==0);
 }
@@ -2782,6 +3076,48 @@ void GrailApplication::Setup(const std::vector<std::string>& args)
     exit (EXIT_FAILURE);
   }
   p->args = args;
+}
+
+void
+GrailApplication::ShutdownApplication()
+{
+  NS_LOG_FUNCTION (this);
+
+  // Remove all outstanding interval timer events
+  for (int i = 0; i < p->timer_count; ++i) {
+    p->m_timerEvents[i].Cancel();
+  }
+
+  // Replace the PromiscReceiveCallback with a NullCallback
+  std::map<int, Ptr<ns3::NetDevice> >::iterator it;
+  for (it = p->m_daemon_netdevice.begin(); it != p->m_daemon_netdevice.end(); it++)
+  {
+    it->second->SetPromiscReceiveCallback (MakeNullCallback<bool,ns3::Ptr<ns3::NetDevice>,
+                                           ns3::Ptr<const ns3::Packet>,short unsigned int,
+                                           const ns3::Address&,const ns3::Address&,ns3::NetDevice::PacketType>());
+  }
+  p->ShutdownHelper();
+}
+
+void
+GrailApplication::DoInitialize (void)
+{
+  NS_LOG_FUNCTION (this);
+  m_startEvent = Simulator::Schedule (m_startTime, &GrailApplication::StartApplication, this);
+  if (m_stopTime != TimeStep (0))
+  {
+    m_stopEvent = Simulator::Schedule (m_stopTime, &GrailApplication::StopApplication, this);
+  }
+
+  if (m_isKairos && (m_kairosShutdownTime != TimeStep (0)))
+  {
+    m_shutdownEvent = Simulator::Schedule (m_kairosShutdownTime, &GrailApplication::ShutdownApplication, this);
+  }
+  else
+  {
+    NS_LOG_WARN("No shutdown time set. Linux system will not shut down correctly.");
+  }
+  Object::DoInitialize ();
 }
 
 }

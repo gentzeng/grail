@@ -72,18 +72,6 @@ enum SyscallHandlerStatusCode {
     NS_LOG_LOGIC(pid << ": [EE] FAKE syscall returned: " << ret_val);   \
   } while(0)
 
-// Same as FAKE, but does exit the simulation if WaitForSyscall(pid)
-// fails, which eludes the need to call ProcessStatusCode(). This
-// macro is used by the signal event helpers.
-#define FAKE3(ret_val) do {                                             \
-    set_reg(pid, orig_rax, SYS_getpid);                                 \
-    if (WaitForSyscall(pid) != 0) {                                     \
-      exit(1);                                                          \
-    }                                                                   \
-    set_reg(pid, rax, ret_val);                                         \
-    NS_LOG_LOGIC(pid << ": [EE] FAKE syscall returned: " << ret_val);   \
-  } while(0)
-
 // Aligns the supplied size to the specified PowerOfTwo
 #define ALIGN_SIZE( sizeToAlign, PowerOfTwo )       \
   (((sizeToAlign) + (PowerOfTwo) - 1) & ~((PowerOfTwo) - 1))
@@ -273,12 +261,30 @@ void StoreToTracee(int pid, T* from, T* to) {
 inline int WaitForSyscall(int pid) {
   int status;
   while (1) {
-    if (WSTOPSIG (status) == SIGALRM) {
+    if (WSTOPSIG(status) == SIGALRM) {
       ptrace(PTRACE_SYSCALL, pid, 0, SIGALRM);
-    } else {
+    } else if (WSTOPSIG(status) == SIGCHLD) {
+      ptrace(PTRACE_SYSCALL, pid, 0, SIGCHLD);
+    } else if (WSTOPSIG(status) == SIGSEGV) {
+      ptrace(PTRACE_SYSCALL, pid, 0, SIGSEGV);
+    } else if (WSTOPSIG(status) == SIGIO) {
+      ptrace(PTRACE_SYSCALL, pid, 0, SIGIO);
+    } else if (WSTOPSIG(status) == SIGINT) {
+      ptrace(PTRACE_SYSCALL, pid, 0, SIGINT);
+    } else if (WSTOPSIG(status) == SIGPOLL) {
+      ptrace(PTRACE_SYSCALL, pid, 0, SIGPOLL);
+    } else if (WSTOPSIG(status) == 0 || WSTOPSIG(status) == 127) {
       ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    } else if (WSTOPSIG(status) == SIGTERM) {
+      printf("Received SIGTERM\n");
+      //ptrace(PTRACE_SYSCALL, pid, 0, SIGTERM);
+			return 1;
+    } else {
+      printf("Unsupported signal number: %i\n", WSTOPSIG(status));
+			ptrace(PTRACE_SYSCALL, pid, 0, 0);
+			//return 1;
     }
-
+    
     waitpid(pid, &status, 0);
     if (WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80))
       return 0;

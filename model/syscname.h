@@ -90,18 +90,32 @@ inline std::string syscname(int syscall) {
     CASESC(SYS_openat);
     CASESC(SYS_clock_getres);
     CASESC(SYS_readlink);
-    CASESC(SYS_pread64);
-    CASESC(SYS_pwrite64);
-    CASESC(SYS_alarm);
-    CASESC(SYS_clock_nanosleep);
-    CASESC(SYS_timer_create);
-    CASESC(SYS_timer_delete);
-    CASESC(SYS_timer_settime);
-    CASESC(SYS_timer_gettime);
+    // UML
+    CASESC(SYS_setsid);
+    CASESC(SYS_wait4);
+    CASESC(SYS_ptrace);
+    CASESC(SYS_statfs);
+    CASESC(SYS_sigaltstack);
+    CASESC(SYS_fsync);
     CASESC(SYS_epoll_create);
     CASESC(SYS_epoll_ctl);
     CASESC(SYS_epoll_wait);
+    CASESC(SYS_timer_create);
+    CASESC(SYS_timer_settime);
+    CASESC(SYS_timer_gettime);
+    CASESC(SYS_timer_delete);
+    CASESC(SYS_chown);
+    CASESC(SYS_kill);
+    CASESC(SYS_rt_sigreturn);
+    CASESC(SYS_mkdir);
     CASESC(SYS_socketpair);
+    CASESC(SYS_pread64);
+    CASESC(SYS_pwrite64);
+    CASESC(SYS_lstat);
+    CASESC(SYS_modify_ldt);
+    CASESC(SYS_clock_nanosleep);
+    CASESC(SYS_getdents64);
+    CASESC(SYS_rmdir);
   }
   std::stringstream ss;
   ss << syscall;
@@ -165,8 +179,11 @@ inline std::string fcntlname(int n) {
     CASESC(F_SETFD);
     CASESC(F_GETFL);
     CASESC(F_SETFL);
+    CASESC(F_GETLK);
     CASESC(F_SETLK);
     CASESC(F_SETLKW);
+    CASESC(F_SETSIG);
+    CASESC(F_SETOWN);
     /* CASESC(); */
   }
   std::stringstream ss;
