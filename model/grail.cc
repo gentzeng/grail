@@ -111,16 +111,6 @@ GrailApplication::GetTypeId (void)
                    BooleanValue (true),
                    MakeBooleanAccessor (&GrailApplication::m_pollLoopDetection),
                    MakeBooleanChecker ())
-    .AddAttribute ("IsKairos",
-                   "Indicates whether the application is a kairos application (OS emulation)",
-                   BooleanValue (false),
-                   MakeBooleanAccessor (&GrailApplication::m_isKairos),
-                   MakeBooleanChecker ())
-    .AddAttribute ("KairosShutdownTime",
-                   "Time at which the Linux system will initiate a shutdown",
-                   TimeValue (TimeStep (0)),
-                   MakeTimeAccessor (&GrailApplication::m_kairosShutdownTime),
-                   MakeTimeChecker ())
   ;
   return tid;
 }
@@ -620,12 +610,7 @@ struct GrailApplication::Priv
 
   //pid_t getpid(void);
   SyscallHandlerStatusCode HandleGetPid() {
-    if (app->m_isKairos) {
-      return HandleSyscallAfter ();
-    }
-
-    FAKE(fake_pid);
-    return SYSC_SUCCESS;
+    return HandleSyscallAfter ();
   }
 
   //int pipe2(int pipefd[2], int flags);
@@ -3042,12 +3027,6 @@ void GrailApplication::StartApplication (void)
 void GrailApplication::StopApplication (void)
 {}
 
-void GrailApplication::SetShutdownTime (Time shutdown)
-{
-  NS_LOG_FUNCTION (this << shutdown);
-  m_kairosShutdownTime = shutdown;
-}
-
 int GrailApplication::Priv::DoTrace()
 {
   int status, c;
@@ -3078,46 +3057,38 @@ void GrailApplication::Setup(const std::vector<std::string>& args)
   p->args = args;
 }
 
-void
-GrailApplication::ShutdownApplication()
-{
-  NS_LOG_FUNCTION (this);
+//void
+//GrailApplication::ShutdownApplication()
+//{
+  //NS_LOG_FUNCTION (this);
 
-  // Remove all outstanding interval timer events
-  for (int i = 0; i < p->timer_count; ++i) {
-    p->m_timerEvents[i].Cancel();
-  }
+  //// Remove all outstanding interval timer events
+  //for (int i = 0; i < p->timer_count; ++i) {
+    //p->m_timerEvents[i].Cancel();
+  //}
 
-  // Replace the PromiscReceiveCallback with a NullCallback
-  std::map<int, Ptr<ns3::NetDevice> >::iterator it;
-  for (it = p->m_daemon_netdevice.begin(); it != p->m_daemon_netdevice.end(); it++)
-  {
-    it->second->SetPromiscReceiveCallback (MakeNullCallback<bool,ns3::Ptr<ns3::NetDevice>,
-                                           ns3::Ptr<const ns3::Packet>,short unsigned int,
-                                           const ns3::Address&,const ns3::Address&,ns3::NetDevice::PacketType>());
-  }
-  p->ShutdownHelper();
-}
+  //// Replace the PromiscReceiveCallback with a NullCallback
+  //std::map<int, Ptr<ns3::NetDevice> >::iterator it;
+  //for (it = p->m_daemon_netdevice.begin(); it != p->m_daemon_netdevice.end(); it++)
+  //{
+    //it->second->SetPromiscReceiveCallback (MakeNullCallback<bool,ns3::Ptr<ns3::NetDevice>,
+                                           //ns3::Ptr<const ns3::Packet>,short unsigned int,
+                                           //const ns3::Address&,const ns3::Address&,ns3::NetDevice::PacketType>());
+  //}
+  //p->ShutdownHelper();
+//}
 
-void
-GrailApplication::DoInitialize (void)
-{
-  NS_LOG_FUNCTION (this);
-  m_startEvent = Simulator::Schedule (m_startTime, &GrailApplication::StartApplication, this);
-  if (m_stopTime != TimeStep (0))
-  {
-    m_stopEvent = Simulator::Schedule (m_stopTime, &GrailApplication::StopApplication, this);
-  }
+//void
+//GrailApplication::DoInitialize (void)
+//{
+  //NS_LOG_FUNCTION (this);
+  //m_startEvent = Simulator::Schedule (m_startTime, &GrailApplication::StartApplication, this);
+  //if (m_stopTime != TimeStep (0))
+  //{
+    //m_stopEvent = Simulator::Schedule (m_stopTime, &GrailApplication::StopApplication, this);
+  //}
 
-  if (m_isKairos && (m_kairosShutdownTime != TimeStep (0)))
-  {
-    m_shutdownEvent = Simulator::Schedule (m_kairosShutdownTime, &GrailApplication::ShutdownApplication, this);
-  }
-  else
-  {
-    NS_LOG_WARN("No shutdown time set. Linux system will not shut down correctly.");
-  }
-  Object::DoInitialize ();
-}
+  //Object::DoInitialize ();
+//}
 
 }
