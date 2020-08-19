@@ -26,7 +26,7 @@ def configure(conf):
         conf.env['MODULES_NOT_BUILT'].append('grail-module')
 
 def build(bld):
-    module = bld.create_ns3_module('grail', ['internet', 'wifi', 'point-to-point'])
+    module = bld.create_ns3_module('grail', ['internet', 'wifi', 'point-to-point', 'csma'])
     module.env.append_value('CXXFLAGS', bld.env.NL_cflags)
     module.env.append_value('LDFLAGS', bld.env.NL_libs)
     module.source = [
