@@ -2745,7 +2745,7 @@ struct GrailApplication::Priv
     void *buf_2 = malloc(ALIGN(unix_socket_buf_size));
     mysv[1] = GetNextFD();
     m_sockets[mysv[1]] = NULL;
-    m_unix_sockets[mysv[0]] = std::make_tuple(buf_2, -1);
+    m_unix_sockets[mysv[1]] = std::make_tuple(buf_2, -1);
     m_connectedSockets.insert(mysv[1]);
 
     m_unix_pairs[mysv[0]] = mysv[1];
